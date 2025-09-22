@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
     curl \
-    bash \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Create writable directories for MLflow artifacts and DB backend for the non-root user
@@ -27,10 +26,3 @@ USER 1001
 # 5. Install necessary Python packages (now as USER 1001 into PIP_TARGET)
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install mlflow psycopg2-binary "sqlalchemy<2.0" alembic
-
-# Copy the startup script
-COPY docker/mlflow_startup.sh .
-
-# Switch back to root to execute the script with bash
-USER root
-CMD ["bash", "/mlflow_app/mlflow_startup.sh"]
