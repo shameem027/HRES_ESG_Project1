@@ -1,4 +1,4 @@
-# --- File: docker-compose.yml (Definitive Final Version - Synchronized) ---
+# --- File: docker/docker-compose.yml (Definitive Final Version - No MLflow Script Mount) ---
 # Removed 'version: 3.8' as it is obsolete and causes a warning.
 
 services:
@@ -30,13 +30,22 @@ services:
       - "5000:5000"
     volumes:
       - mlflow_artifacts:/mlflow/artifacts
-      - ./docker/mlflow_startup.sh:/mlflow_app/mlflow_startup.sh  # Mount the script
+      # --- CRITICAL FIX: Removed the problematic volume mount for mlflow_startup.sh ---
+      # No more - ./docker/mlflow_startup.sh:/usr/local/bin/mlflow_startup.sh
     networks:
       - hres_network
     depends_on:
-      - postgres
+      postgres:
         condition: service_healthy
-    command: ["bash", "/mlflow_app/mlflow_startup.sh"]  # Execute the script
+    # CMD is now handled entirely within the Dockerfile itself
+    # It will execute the script /usr/local/bin/mlflow_startup.sh that is now COPIED INTO THE IMAGE
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
 
   airflow-init:
     build:
@@ -47,7 +56,7 @@ services:
     networks:
       - hres_network
     depends_on:
-      - postgres
+      postgres:
         condition: service_healthy
     command: ["bash", "-c", "airflow db migrate && airflow users create --username ${AIRFLOW_WWW_USER_USERNAME} --password ${AIRFLOW_WWW_USER_PASSWORD} --firstname Airflow --lastname User --role Admin --email airflow@example.com || true"]
     restart: "no"
@@ -67,9 +76,9 @@ services:
     networks:
       - hres_network
     depends_on:
-      - airflow-init
+      airflow-init:
         condition: service_completed_successfully
-      - mlflow
+      mlflow:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl --silent --fail http://localhost:8080/health"]
@@ -93,7 +102,7 @@ services:
     networks:
       - hres_network
     depends_on:
-      - airflow-webserver
+      airflow-webserver:
         condition: service_healthy
     command: ["airflow", "scheduler"]
     restart: unless-stopped
@@ -112,7 +121,7 @@ services:
     networks:
       - hres_network
     depends_on:
-      - mlflow
+      mlflow:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -135,7 +144,7 @@ services:
     networks:
       - hres_network
     depends_on:
-      - api
+      api:
         condition: service_healthy
     restart: unless-stopped
 
