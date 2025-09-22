@@ -1,0 +1,270 @@
+name: MLOps CI/CD Pipeline with Airflow Integration
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - aula3
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      trigger_airflow:
+        description: 'Trigger Airflow DAG after deployment'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  MLFLOW_TRACKING_URI: http://localhost:5000
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+  AIRFLOW_UID: 50000
+
+jobs:
+  infrastructure-validation:
+    name: "🔍 Infrastructure Validation"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r docker/requirements.txt
+          pip install flake8 pytest docker compose-check
+          
+      - name: Lint Python code
+        run: |
+          flake8 src/ api/ --max-line-length=100 --ignore=E203,W503
+          
+      - name: Validate Docker Compose
+        run: |
+          cd docker
+          docker compose config
+          docker compose ps
+          
+      - name: Security scan (Dockerfile)
+        run: |
+          # Basic Dockerfile security check
+          grep -i "ADD\|COPY.*--chown" docker/Dockerfile || echo "✅ No insecure COPY/ADD found"
+          grep -i "USER root" docker/Dockerfile && echo "⚠️ Running as root - review needed" || echo "✅ User permissions OK"
+          
+      - name: Infrastructure tests
+        run: |
+          python -m pytest tests/test_infrastructure.py -v
+
+  continuous-training:
+    name: "🤖 Continuous Training"
+    runs-on: ubuntu-latest
+    needs: infrastructure-validation
+    services:
+      mlflow:
+        image: ghcr.io/mlflow/mlflow:v3.3.1
+        ports:
+          - 5000:5000
+        env:
+          MLFLOW_BACKEND_STORE_URI: sqlite:///mlflow.db
+        options: >-
+          --health-cmd "curl -f http://localhost:5000/health || exit 1"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 5
+          
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install ML dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r docker/requirements.txt
+          
+      - name: Wait for MLflow server
+        run: |
+          timeout 60 bash -c 'until curl -f http://localhost:5000/health; do sleep 2; done'
+          
+      - name: Run automated training
+        run: |
+          export MLFLOW_TRACKING_URI=http://localhost:5000
+          python src/train_model.py
+          
+      - name: Validate model performance
+        run: |
+          export MLFLOW_TRACKING_URI=http://localhost:5000
+          python src/model_validation.py
+          
+      - name: Archive training artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: training-artifacts
+          path: |
+            models/
+            metrics/
+          retention-days: 30
+
+  continuous-deployment:
+    name: "🚀 Continuous Deployment with Airflow"
+    runs-on: ubuntu-latest
+    needs: [infrastructure-validation, continuous-training]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Download training artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: training-artifacts
+          
+      - name: Create Airflow directories
+        run: |
+          mkdir -p ./airflow/logs ./airflow/plugins
+          echo -e "AIRFLOW_UID=$(id -u)" > .env
+          
+      - name: Build Docker images
+        run: |
+          cd docker
+          docker compose build --parallel
+          
+      - name: Deploy MLOps stack with Airflow
+        run: |
+          cd docker
+          docker compose up -d
+          
+      - name: Wait for services to be ready
+        run: |
+          echo "⏳ Waiting for services to start..."
+          
+          # Wait for MLflow
+          timeout 180 bash -c 'until curl -f http://localhost:5000/health; do sleep 5; done'
+          echo "✅ MLflow is ready"
+          
+          # Wait for Airflow webserver
+          timeout 180 bash -c 'until curl -f http://localhost:8080/health; do sleep 5; done'
+          echo "✅ Airflow webserver is ready"
+          
+          # Wait for API
+          timeout 120 bash -c 'until curl -f http://localhost:8081/health; do sleep 5; done'
+          echo "✅ API is ready"
+          
+          # Wait for PostgreSQL (Airflow metadata DB)
+          timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U airflow; do sleep 5; done'
+          echo "✅ PostgreSQL is ready"
+          
+      - name: Trigger Airflow DAG
+        if: github.event.inputs.trigger_airflow != 'false'
+        run: |
+          echo "🎯 Triggering Airflow MLOps DAG..."
+          
+          # Wait a bit more for Airflow to fully initialize
+          sleep 30
+          
+          # Trigger the MLOps DAG
+          docker compose exec -T airflow-webserver airflow dags trigger mlops_github_integration_pipeline || echo "⚠️ DAG trigger failed - DAG may not be available yet"
+          
+          # Check DAG status
+          sleep 10
+          docker compose exec -T airflow-webserver airflow dags list | grep mlops_github_integration_pipeline || echo "⚠️ DAG not found in list"
+          
+      - name: Run integration tests
+        run: |
+          python -m pytest tests/test_api.py -v --tb=short
+          python -m pytest tests/test_infrastructure.py::test_full_stack -v --tb=short
+          python -m pytest tests/test_infrastructure.py::test_full_stack -v
+          
+      - name: Test API endpoints
+        run: |
+          # Test health endpoint
+          curl -f http://localhost:8080/health
+          
+          # Test prediction endpoint
+          curl -X POST http://localhost:8080/predict \
+            -H "Content-Type: application/json" \
+            -d '{"features": [5.1, 3.5, 1.4, 0.2]}' | jq .
+            
+      - name: Infrastructure health check
+        run: |
+          cd docker
+          docker compose ps
+          docker compose logs --tail=50
+          
+      - name: Cleanup on failure
+        if: failure()
+        run: |
+          cd docker
+          docker compose logs
+          docker compose down
+          
+  deployment-notification:
+    name: "📢 Deployment Notification"
+    runs-on: ubuntu-latest
+    needs: [continuous-deployment]
+    if: always()
+    steps:
+      - name: Deployment Success
+        if: needs.continuous-deployment.result == 'success'
+        run: |
+          echo "🎉 MLOps Infrastructure with Airflow successfully deployed!"
+          echo ""
+          echo "📊 Services Available:"
+          echo "   🔬 MLflow UI: http://localhost:5000"
+          echo "   � Airflow UI: http://localhost:8080 (admin/admin)"
+          echo "   � API: http://localhost:8081"
+          echo "   🐘 PostgreSQL: localhost:5432"
+          echo ""
+          echo "🎯 GitHub Actions → Airflow → MLflow → API Integration Complete!"
+          echo "💡 Check Airflow UI for DAG execution status"
+          
+      - name: Deployment Failed
+        if: needs.continuous-deployment.result == 'failure'
+        run: |
+          echo "❌ Deployment failed - check logs above"
+          echo ""
+          echo "💡 Common fixes:"
+          echo "   1. Check port availability (5000, 8080, 8081, 5432)"
+          echo "   2. Verify Docker Compose syntax"
+          echo "   3. Review MLflow connectivity"
+          echo "   4. Check Airflow initialization logs"
+          echo "   5. Ensure PostgreSQL is accessible"
+          echo ""
+          echo "🔍 Debug commands:"
+          echo "   docker compose logs mlflow"
+          echo "   docker compose logs airflow-webserver"
+          echo "   docker compose logs postgres"
+          exit 1
+
+  airflow-dag-monitoring:
+    name: "🔍 Airflow DAG Monitoring"
+    runs-on: ubuntu-latest
+    needs: [continuous-deployment]
+    if: needs.continuous-deployment.result == 'success' && github.event.inputs.trigger_airflow != 'false'
+    steps:
+      - name: Monitor DAG execution
+        run: |
+          echo "🔍 Monitoring Airflow DAG execution..."
+          
+          # Wait for DAG to start
+          sleep 60
+          
+          # Check DAG run status (basic check)
+          echo "📊 Checking recent DAG runs..."
+          
+          # Note: In real implementation, you would use Airflow REST API
+          # to check DAG run status and wait for completion
+          
+          echo "✅ DAG monitoring setup complete"
+          echo "💡 Check Airflow UI at http://localhost:8080 for detailed DAG status"

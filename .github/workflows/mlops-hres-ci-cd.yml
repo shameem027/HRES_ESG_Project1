@@ -1,0 +1,285 @@
+# --- File: .github/workflows/mlops-hres-ci-cd.yml (NEW FILE - HRES MLOps CI/CD Pipeline) ---
+name: HRES MLOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch: # Allows manual trigger
+    inputs:
+      trigger_airflow_dag:
+        description: 'Trigger Airflow DAG after successful deployment'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  MLFLOW_TRACKING_URI: http://localhost:5000 # For direct MLflow service in CI
+  # For Docker Compose in CI/CD, these refer to the services defined below
+  POSTGRES_USER: airflow
+  POSTGRES_PASSWORD: airflow
+  POSTGRES_DB: airflow
+  AIRFLOW_WWW_USER_USERNAME: airflow
+  AIRFLOW_WWW_USER_PASSWORD: airflow
+  AIRFLOW_UID: 50000 # Important for CI user permissions
+
+jobs:
+  # ========================================================================
+  # Job 1: Infrastructure and Code Validation
+  # Ensures Docker Compose syntax, basic code quality, and Dockerfiles are valid.
+  # ========================================================================
+  infrastructure-validation:
+    name: "🔍 Infrastructure Validation"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies for validation
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt # Path from root
+          pip install flake8 pytest docker compose-check # Add compose-check for validation
+
+      - name: Lint Python code
+        run: |
+          # Lint src and api directories
+          flake8 src/ api/ --max-line-length=100 --ignore=E203,W503,F401,E501
+
+      - name: Validate Docker Compose Configuration
+        run: |
+          cd docker
+          docker compose config --quiet # Checks for syntax errors
+          echo "✅ Docker Compose configuration is valid"
+
+      - name: Security scan (Dockerfile.api, Dockerfile.ui, Dockerfile.mlflow, Dockerfile.jupyter, Dockerfile.airflow)
+        run: |
+          echo "🔍 Running basic Dockerfile security checks..."
+          for DOCKERFILE in docker/Dockerfile.api docker/Dockerfile.ui docker/Dockerfile.mlflow docker/Dockerfile.jupyter docker/Dockerfile.airflow; do
+            echo "--- Checking $DOCKERFILE ---"
+            grep -i "ADD\|COPY.*--chown" "$DOCKERFILE" && echo "  ⚠️ Insecure COPY/ADD found - review needed" || echo "  ✅ No insecure COPY/ADD found"
+            grep -i "USER root" "$DOCKERFILE" && echo "  ⚠️ Running as root - review needed" || echo "  ✅ User permissions OK (no explicit USER root found)"
+            grep -i "apt-get update && apt-get install" "$DOCKERFILE" && ! grep -i "rm -rf /var/lib/apt/lists/*" "$DOCKERFILE" && echo "  ⚠️ apt cache not cleared - review needed" || echo "  ✅ apt cache handled"
+          done
+          echo "✅ Dockerfile security checks completed."
+
+      - name: Run infrastructure tests
+        run: |
+          python -m pytest tests/test_infrastructure.py -v
+
+  # ========================================================================
+  # Job 2: Continuous Training & ML Model Management
+  # Trains the ML model, logs to MLflow, and potentially registers it.
+  # ========================================================================
+  continuous-training:
+    name: "🤖 Continuous Training"
+    runs-on: ubuntu-latest
+    needs: infrastructure-validation
+    services:
+      # MLflow service directly within this job for isolation
+      mlflow:
+        image: ghcr.io/mlflow/mlflow:v2.9.2 # Use specific MLflow version
+        ports:
+          - 5000:5000
+        env:
+          MLFLOW_BACKEND_STORE_URI: postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@postgres:5432/${{ env.POSTGRES_DB }}
+        options: >-
+          --network ${{ job.services.postgres.network }}
+          --health-cmd "curl -f http://localhost:5000/health || exit 1"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 5
+          --health-start-period 10s
+      postgres: # Postgres service for MLflow backend
+        image: postgres:13
+        env:
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }}"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 5s
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install ML dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Wait for MLflow and Postgres services
+        run: |
+          echo "⏳ Waiting for Postgres and MLflow to be ready..."
+          timeout 120 bash -c 'until curl -f http://localhost:5000/health; do sleep 5; done'
+          echo "✅ MLflow is ready"
+
+      - name: Generate HRES Dataset
+        run: |
+          echo "⚙️ Generating HRES dataset..."
+          python src/HRES_Dataset_Generator.py
+          echo "✅ HRES Dataset generated."
+
+      - name: Train and Log ML Models
+        run: |
+          export MLFLOW_TRACKING_URI=http://mlflow:5000 # MLflow is accessible via its service name
+          echo "🧠 Training HRES ML models and logging to MLflow..."
+          python src/HRES_ML_Model.py
+          echo "✅ ML Models trained and logged."
+
+      - name: Run MCDA Model Validation
+        run: |
+          export MLFLOW_TRACKING_URI=http://mlflow:5000
+          echo "🧪 Validating MCDA decision logic..."
+          python -m pytest tests/test_mcda_validation.py -v # Assuming a validation script for MCDA
+          echo "✅ MCDA validation complete."
+
+      - name: Archive MLflow Artifacts and Dataset
+        uses: actions/upload-artifact@v3
+        with:
+          name: ml_artifacts
+          path: |
+            src/HRES_Dataset.csv
+            mlruns/ # MLflow's default local tracking dir
+          retention-days: 30
+
+  # ========================================================================
+  # Job 3: Continuous Deployment to Docker (Local Stack)
+  # Builds and deploys the entire Docker Compose stack.
+  # ========================================================================
+  continuous-deployment:
+    name: "🚀 Continuous Deployment to Docker"
+    runs-on: ubuntu-latest
+    needs: [continuous-training]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download ML artifacts and dataset
+        uses: actions/download-artifact@v3
+        with:
+          name: ml_artifacts
+          path: . # Download to root, so src/HRES_Dataset.csv is placed correctly
+
+      - name: Make executable scripts executable (if any)
+        run: |
+          chmod +x docker/*.sh || true # Make all .sh files executable, ignore if none
+
+      - name: Build Docker images
+        run: |
+          cd docker
+          docker compose build --parallel --no-cache # Force rebuild with latest changes
+
+      - name: Deploy MLOps stack
+        run: |
+          cd docker
+          # Using project's .env for credentials (Postgres, Airflow)
+          docker compose up -d postgres mlflow airflow-init airflow-webserver airflow-scheduler api ui jupyter
+
+      - name: Wait for all services to be ready
+        run: |
+          echo "⏳ Waiting for all services to start and become healthy..."
+          
+          # Wait for Postgres
+          timeout 180 bash -c 'until docker compose exec -T postgres pg_isready -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }}; do sleep 5; done'
+          echo "✅ Postgres is ready"
+          
+          # Wait for MLflow
+          timeout 180 bash -c 'until curl -f http://localhost:5000/health; do sleep 5; done'
+          echo "✅ MLflow is ready"
+
+          # Wait for Airflow Webserver
+          timeout 180 bash -c 'until curl -f http://localhost:8080/health; do sleep 5; done'
+          echo "✅ Airflow Webserver is ready"
+          
+          # Wait for our custom API service (exposed on host port 8081)
+          timeout 180 bash -c 'until curl -f http://localhost:8081/health; do sleep 5; done'
+          echo "✅ HRES API is ready"
+          
+          # No need to wait for UI/Jupyter here as they depend on API/other services
+          echo "🎉 All core services are up and healthy!"
+
+      - name: Trigger Airflow DAG (Optional)
+        if: github.event.inputs.trigger_airflow_dag == true
+        run: |
+          echo "🎯 Triggering Airflow MLOps DAG for HRES Automation..."
+          # Need to ensure Airflow components are fully up and have detected DAGs
+          sleep 60 # Give Airflow time to parse DAGs
+          docker compose exec -T airflow-webserver airflow dags unpause HRES_PhD_Automation_Pipeline || true
+          sleep 5
+          docker compose exec -T airflow-webserver airflow dags trigger HRES_PhD_Automation_Pipeline || echo "⚠️ DAG trigger failed - DAG may not be available yet or name is wrong"
+          echo "✅ Airflow DAG trigger attempted."
+
+      - name: Run Integration Tests (API and UI Interaction)
+        run: |
+          pip install requests
+          python -m pytest tests/test_api_integration.py -v # Test API calls
+          python -m pytest tests/test_ui_integration.py -v  # Test UI basic interaction
+
+      - name: Display running services (for debug)
+        if: always()
+        run: |
+          cd docker
+          docker compose ps
+          docker compose logs --tail=50
+
+      - name: Cleanup on failure or completion
+        if: always() # Always run cleanup
+        run: |
+          cd docker
+          docker compose down -v
+          docker system prune -f -a --volumes # Aggressive cleanup
+
+  # ========================================================================
+  # Job 4: Deployment Notification
+  # Provides summary of deployment status.
+  # ========================================================================
+  deployment-notification:
+    name: "📢 Deployment Notification"
+    runs-on: ubuntu-latest
+    needs: [continuous-deployment]
+    if: always() # Always run this job
+    steps:
+      - name: Deployment Success
+        if: needs.continuous-deployment.result == 'success'
+        run: |
+          echo "🎉 HRES MLOps Stack successfully deployed in CI!"
+          echo ""
+          echo "📊 Services on localhost (if run locally):"
+          echo "   🔬 MLflow UI: http://localhost:5000"
+          echo "   ☁️ Airflow UI: http://localhost:8080 (admin/admin)"
+          echo "   💡 HRES Advisor UI: http://localhost:8501"
+          echo "   🔌 HRES API: http://localhost:8081"
+          echo "   📓 Jupyter Lab: http://localhost:8888"
+          echo ""
+          echo "👉 To run locally after cloning, navigate to 'docker' folder and run:"
+          echo "   docker-compose up --build"
+
+      - name: Deployment Failed
+        if: needs.continuous-deployment.result == 'failure'
+        run: |
+          echo "❌ HRES MLOps Stack deployment failed - check logs above"
+          echo ""
+          echo "💡 Common issues: Port conflicts, Docker Compose syntax, service startup order."
+          exit 1

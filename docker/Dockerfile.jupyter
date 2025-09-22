@@ -1,0 +1,35 @@
+# --- File: docker/Dockerfile.jupyter (Definitive Final Version - Bulletproof User Management) ---
+# Start from the base Jupyter SciPy Notebook image
+FROM jupyter/scipy-notebook:latest
+
+# The jupyter/scipy-notebook image defaults to 'jovyan' user (defined by $NB_USER).
+
+# 1. Install system dependencies as root
+USER root
+WORKDIR /home/jovyan # Still set WORKDIR for clarity
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Create a writable directory for Python packages for the non-root user
+#    and set PIP_TARGET to this directory.
+ENV PIP_TARGET=/opt/conda/lib/python3.11/site-packages/user_packages
+RUN mkdir -p ${PIP_TARGET} && chown ${NB_UID}:${NB_GID} ${PIP_TARGET}
+
+# 3. Copy requirements.txt (still as root for this COPY)
+COPY requirements.txt .
+
+# 4. Switch back to the default Jupyter user (jovyan), which is defined by $NB_USER.
+USER $NB_USER
+
+# 5. Install dependencies (now as $NB_USER into PIP_TARGET)
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 6. Create a notebooks directory (implicitly created by base image, owned by jovyan)
+RUN mkdir -p /home/jovyan/notebooks
+
+# Expose the Jupyter port
+EXPOSE 8888
+
+# The start command is in docker-compose.yml
